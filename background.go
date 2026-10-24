@@ -18,6 +18,8 @@ import (
 
 const keeperResponsePrefix = "resp_ck_"
 
+var errBackgroundFailure = errors.New("upstream response ended unsuccessfully")
+
 type backgroundTaskKey struct{}
 
 // Event payloads live in the existing budgeted disk spool, not per-reader RAM.
@@ -37,6 +39,7 @@ type responseTask struct {
 	count                              int
 	final                              int64
 	done, complete, cancelled, expired bool
+	failureTerminal                    bool
 	err                                error
 	readers, pending                   int // attached readers; reads awaiting validation
 	changed                            chan struct{}
@@ -245,8 +248,21 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 	if err := json.Unmarshal(event["type"], &kind); err != nil {
 		return err
 	}
-	if kind == "error" || kind == "response.failed" || kind == "response.incomplete" {
-		return errUpstreamData
+	failed := kind == "error" || kind == "response.failed" || kind == "response.incomplete"
+	if kind == "error" {
+		failure := event
+		if event["code"] == nil && event["message"] == nil {
+			failure, err = responseObject(event["error"])
+			if err != nil {
+				return err
+			}
+		}
+		_, codeErr := responseString(failure["code"])
+		var message *string
+		messageErr := json.Unmarshal(failure["message"], &message)
+		if codeErr != nil || messageErr != nil || message == nil {
+			return errUpstreamData
+		}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -256,11 +272,31 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 	if t.complete {
 		return errUpstreamData
 	}
+	if failed && event["response_id"] != nil {
+		id, err := responseString(event["response_id"])
+		if err != nil || id == "" || (t.upstreamID != "" && id != t.upstreamID && id != publicID(t.upstreamID)) {
+			return errUpstreamData
+		}
+	}
 	event["sequence_number"] = json.RawMessage(strconv.Itoa(t.count))
 	if response := event["response"]; response != nil {
 		var doc map[string]json.RawMessage
 		if err := json.Unmarshal(response, &doc); err != nil {
 			return err
+		}
+		if doc == nil {
+			return errUpstreamData
+		}
+		if failed {
+			id, idErr := responseString(doc["id"])
+			status, statusErr := responseString(doc["status"])
+			if idErr != nil || statusErr != nil || id == "" || (kind != "error" && "response."+status != kind) ||
+				(t.upstreamID != "" && id != t.upstreamID && id != publicID(t.upstreamID)) {
+				return errUpstreamData
+			}
+			if _, err := responseItems(doc["output"]); err != nil {
+				return err
+			}
 		}
 		if t.nativeParent && t.count == 0 {
 			var upstreamID string
@@ -284,6 +320,9 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 			return err
 		}
 	}
+	if failed && event["response"] == nil && kind != "error" {
+		return errUpstreamData
+	}
 	if _, ok := event["response_id"]; ok {
 		event["response_id"], _ = json.Marshal(t.id)
 	}
@@ -306,8 +345,15 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 		t.complete = true
 		t.final = offset
 	}
+	if failed {
+		// Attached readers drain this bounded log; new reads fail and the last reader discards it.
+		t.failureTerminal, t.err = true, errBackgroundFailure
+	}
 	t.readyOnce.Do(func() { close(t.ready) })
 	t.signal()
+	if failed {
+		return errBackgroundFailure
+	}
 	return nil
 }
 
@@ -373,9 +419,10 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 			t.mu.Unlock()
 			return io.ErrUnexpectedEOF
 		}
-		// A failed generation still delivers its recorded prefix (including the
-		// response id) before aborting, so the creator learns which task failed.
+		// Failed generations drain their prefix and original terminal; truncated
+		// streams still abort once their recorded prefix ends.
 		size, done, failed, changed := body.spool.size, t.done, t.err != nil, t.changed
+		terminal := t.failureTerminal
 		t.mu.Unlock()
 		if offset < size {
 			n := size - offset
@@ -404,6 +451,10 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 			continue
 		}
 		if failed {
+			// A forwarded failure is a complete SSE terminal, not a truncated transport.
+			if terminal {
+				return nil
+			}
 			return io.ErrUnexpectedEOF
 		}
 		if done {
